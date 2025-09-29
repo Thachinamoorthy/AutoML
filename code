@@ -1,0 +1,613 @@
+import streamlit as st
+import pandas as pd
+import os
+import pickle
+import subprocess
+import seaborn as sns
+import matplotlib.pyplot as plt
+import plotly.express as px
+import numpy as np
+from PIL import Image
+import base64
+from agent import AutoMLAgent
+from pipeline import run_automl, predict, generate_shap, plot_target_distribution,
+detect_uninformative_columns
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+def get_base64(bin_file):
+with open(bin_file, "rb") as f:
+return base64.b64encode(f.read()).decode()
+def set_background(full_bg_path, sidebar_bg_path):
+full_bg_ext = full_bg_path.split('.')[-1]
+sidebar_ext = sidebar_bg_path.split('.')[-1]
+full_bg = get_base64(full_bg_path)
+sidebar_bg = get_base64(sidebar_bg_path)
+st.markdown(
+f"""
+<style>
+/* Full App Background */
+.stApp {{
+background-image: url("data:image/{full_bg_ext};base64,{full_bg}");
+background-size: cover;
+background-repeat: no-repeat;
+39
+background-attachment: fixed;
+}}
+/* Sidebar Background */
+[data-testid="stSidebar"] > div:first-child {{
+background-image: url("data:image/{sidebar_ext};base64,{sidebar_bg}");
+background-size: cover;
+background-repeat: no-repeat;
+}}
+/* Custom Footer */
+footer {{
+visibility: hidden;
+}}
+.footer-container {{
+position: fixed;
+left: 0;
+bottom: 0;
+width: 100%;
+background-color: #2c3e50;
+color: white;
+text-align: right;
+padding: 10px;
+font-size: 14px;
+z-index: 100;
+}}
+/* Theme Enhancements */
+.stButton>button {{
+background-color: #2980b9;
+color: white;
+border: none;
+border-radius: 8px;
+padding: 0.5em 1em;
+}}
+.stSelectbox, .stTextInput>div>div>input, .stTextArea>div>textarea {{
+background-color: #f5f5f5 !important;
+color: #333;
+}}
+.stMarkdown h1, h2, h3, h4, h5 {{
+color: #1e272e;
+40
+}}
+</style>
+<div class="footer-container">
+ℹ️ Need Help? Contact: thachinamoorthyvetri@gmail.com
+</div>
+""",
+unsafe_allow_html=True
+)
+st.set_page_config(layout="wide", page_title="AutoML Deployment Agent",
+page_icon="🤖")
+set_background("background.jpg","sidebar.jpg")
+st.title("AutoML Deployment Agent by Thetchina")
+# --- Session State Initialization ---
+for key in ["df", "model_trained", "deploy_clicked", "target_col"]:
+if key not in st.session_state:
+st.session_state[key] = None if key == "df" else False
+# --- Sidebar Navigation ---
+st.sidebar.header("📌 ACTIONS")
+st.markdown("""
+<style>
+[data-testid="stSidebar"] button {
+width: 100% !important;
+min-width: 180px !important;
+max-width: 100% !important;
+margin-bottom: 10px;
+font-weight: 600;
+border-radius: 8px;
+box-sizing: border-box;
+}
+</style>
+""", unsafe_allow_html=True)
+pages = ["Upload Dataset", "Explore Dataset", "Run ML Agent", "Training Status",
+"Retrain Model"]
+if "selected_page" not in st.session_state:
+st.session_state.selected_page = pages[0]
+for p in pages:
+41
+if st.sidebar.button(p, key=f"nav_{p}"):
+st.session_state.selected_page = p
+page = st.session_state.selected_page
+# --- Dataset Upload ---
+if page == "Upload Dataset":
+uploaded_file = st.file_uploader("📂 Upload CSV Dataset", type="csv")
+if uploaded_file:
+df = pd.read_csv(uploaded_file)
+st.session_state.df = df
+st.success("✅ Dataset uploaded successfully!")
+st.dataframe(df.head())
+st.subheader("🧼 Gemini Cleaning Suggestions")
+if st.button("✨ Generate Cleaning Suggestions"):
+agent = AutoMLAgent()
+with st.spinner("Generating suggestions..."):
+suggestion = agent.get_cleaning_suggestion(df)
+code = agent.get_cleaning_code(df)
+st.markdown(suggestion)
+st.code(code, language="python")
+st.session_state.cleaning_code = code
+if "cleaning_code" in st.session_state:
+if st.button("✅ Apply Cleaning Suggestions"):
+try:
+code = st.session_state.cleaning_code
+local_vars = {}
+exec(code, globals(), local_vars)
+clean_data = local_vars["clean_data"]
+df_cleaned = clean_data(df)
+st.session_state.df = df_cleaned
+st.success("✅ Cleaning applied successfully!")
+with st.expander("🔍 Preview Cleaned Data"):
+st.dataframe(df_cleaned.head())
+except Exception as e:
+st.error(f"Error while applying cleaning code: {e}")
+# --- EDA Function ---
+def run_eda(df):
+st.header("🔎 Exploratory Data Analysis")
+42
+st.subheader("📊 Dataset Preview")
+st.dataframe(df.head(50))
+st.subheader("📈 Basic Statistics")
+st.write(df.describe(include="all"))
+st.subheader("📉 Missing Values Heatmap")
+fig, ax = plt.subplots()
+sns.heatmap(df.isnull(), cbar=False, cmap="YlOrRd", ax=ax)
+st.pyplot(fig)
+st.subheader("🧮 Feature Types")
+feature_types = df.dtypes.reset_index()
+feature_types.columns = ["Feature", "Type"]
+st.dataframe(feature_types)
+st.subheader("📌 Feature Distribution")
+numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+if numeric_cols:
+selected_col = st.selectbox("Select a feature", numeric_cols)
+fig = px.histogram(df, x=selected_col, marginal="box", nbins=30)
+st.plotly_chart(fig)
+else:
+st.warning("No numeric columns available.")
+st.subheader("📉 Correlation Heatmap")
+if len(numeric_cols) >= 2:
+corr = df[numeric_cols].corr()
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
+st.pyplot(fig)
+else:
+st.warning("Not enough numeric columns.")
+# --- Main Control Logic ---
+if st.session_state.df is not None:
+df = st.session_state.df
+if page == "Explore Dataset":
+run_eda(df)
+elif page == "Run ML Agent":
+st.subheader("🎯 Select Target Column")
+43
+target = st.selectbox("Select Target Column", df.columns,
+index=df.columns.get_loc(st.session_state.target_col) if st.session_state.target_col in
+df.columns else 0)
+st.success(f"✅ Selected: {target}")
+if st.button("🚀 Run AutoML Agent"):
+agent = AutoMLAgent()
+with st.spinner("🔍 Gemini Agent analyzing..."):
+task_type = agent.get_task_type(df)
+st.session_state.target_col = target
+st.markdown(f"### 🧠 Detected Task Type: **{task_type.upper()}**")
+st.markdown("### 📊 Target Distribution")
+plot_target_distribution(df, target)
+st.image("outputs/target_dist.png")
+st.markdown("### ⚙️ Training FLAML Model...")
+import time
+start_time = time.time()
+progress = st.progress(0)
+model, X = run_automl(df, target)
+progress.progress(100)
+with open("trained_model.pkl", "wb") as f:
+pickle.dump(model, f)
+feature_types = X.dtypes.apply(lambda dt: dt.name).to_dict()
+with open("feature_types.pkl", "wb") as f:
+pickle.dump(feature_types, f)
+st.session_state.model_trained = True
+st.success("✅ Model training completed!")
+end_time = time.time()
+st.markdown("### 🧾 Training Summary")
+st.write(f"Model Type: `{model.estimator}`")
+st.write(f"Training Duration: `{end_time - start_time:.2f}` seconds")
+st.markdown("### 📈 SHAP Feature Importance")
+try:
+generate_shap(model, X)
+st.image("outputs/shap_plot.png", caption="SHAP Feature Importance")
+44
+except Exception as e:
+st.error(f"⚠️ Failed to generate SHAP plot: {e}")
+if st.session_state.model_trained:
+st.markdown("### 🚀 Deploy Model")
+if st.button("🔌 Deploy Model"):
+if not st.session_state.deploy_clicked:
+st.session_state.deploy_clicked = True
+try:
+subprocess.Popen(["streamlit", "run", "predictor_ui.py"],
+stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+st.toast("✅ Predictor UI launched!", icon="🚀")
+except Exception as e:
+st.error(f"❌ Launch failed: {e}")
+else:
+st.info("ℹ️ Prediction UI is already running.")
+elif page == "Training Status":
+if os.path.exists("trained_model.pkl"):
+st.success("✅ Model is trained and ready.")
+if st.button("📈 Show SHAP Plot"):
+if os.path.exists("outputs/shap_plot.png"):
+st.image("outputs/shap_plot.png")
+else:
+st.warning("⚠️ SHAP plot not found.")
+if st.button("🔌 Deploy Model"):
+if not st.session_state.deploy_clicked:
+st.session_state.deploy_clicked = True
+try:
+subprocess.Popen(["streamlit", "run", "predictor_ui.py"],
+stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+st.toast("✅ Predictor UI launched!", icon="🚀")
+except Exception as e:
+st.error(f"❌ Launch failed: {e}")
+else:
+st.info("ℹ️ Prediction UI is already running.")
+else:
+st.warning("⚠️ Model is not yet trained.")
+elif page == "Retrain Model":
+45
+if os.path.exists("trained_model.pkl"):
+if st.button("🔁 Retrain Now"):
+with open("trained_model.pkl", "rb") as f:
+model = pickle.load(f)
+st.success("✅ Model reloaded (retraining logic can be expanded)")
+st.markdown("### 🚀 Deploy Model")
+if st.button("🔌 Deploy Model"):
+if not st.session_state.deploy_clicked:
+st.session_state.deploy_clicked = True
+try:
+subprocess.Popen(["streamlit", "run", "predictor_ui.py"],
+stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+st.toast("✅ Predictor UI launched!", icon="🚀")
+except Exception as e:
+st.error(f"❌ Launch failed: {e}")
+else:
+st.info("ℹ️ Prediction UI is already running.")
+else:
+st.warning("⚠️ No model found to retrain.")
+# --- Download Model ---
+if os.path.exists("trained_model.pkl"):
+with open("trained_model.pkl", "rb") as f:
+st.download_button(
+label="⬇️ Download Trained Model",
+data=f,
+file_name="trained_model.pkl",
+mime="application/octet-stream",
+)
+A.2 pipeline.py – AutoML with FLAML
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+import joblib # Import joblib for saving models
+from flaml import AutoML
+def run_automl(df: pd.DataFrame, target_col: str):
+46
+"""Runs AutoML on the dataset and returns the trained model and feature data."""
+X = df.drop(columns=[target_col])
+y = df[target_col]
+# Convert object columns to category
+for col in X.select_dtypes(include=["object"]).columns:
+X[col] = X[col].astype("category")
+automl = AutoML()
+task_type = "classification" if y.nunique() <= 20 else "regression"
+metric = "accuracy" if task_type == "classification" else "r2"
+if task_type == "classification" and not pd.api.types.is_numeric_dtype(y):
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
+joblib.dump(label_encoder, "label_encoder.pkl") # Save encoder
+else:
+y_encoded = y
+label_encoder = None
+automl = AutoML()
+automl_settings = {
+"time_budget": 60, # seconds
+"metric": metric,
+"task": task_type,
+"log_file_name": "automl.log",
+}
+automl.fit(X_train=X, y_train=y_encoded, **automl_settings)
+joblib.dump(automl.model, "trained_model.pkl") # Save the model
+joblib.dump(X.dtypes.to_dict(), "trained_dtypes.pkl") # Save dtypes for consistent
+prediction
+return automl.model, X
+def predict(model, df: pd.DataFrame):
+"""Predict with the trained model, ensuring column types match training."""
+dtype_map = joblib.load("trained_dtypes.pkl")
+47
+for col, dtype in dtype_map.items():
+if col in df.columns:
+df[col] = df[col].astype(dtype)
+preds = model.predict(df)
+# Decode labels if classification
+if os.path.exists("label_encoder.pkl"):
+label_encoder = joblib.load("label_encoder.pkl")
+preds = label_encoder.inverse_transform(preds)
+return preds
+def detect_uninformative_columns(df: pd.DataFrame):
+"""Detects columns that are likely uninformative."""
+drop_cols = []
+for col in df.columns:
+if df[col].nunique() == len(df): # Unique values → ID-like
+drop_cols.append(col)
+elif df[col].dtype == 'object' and df[col].nunique() / len(df) > 0.95:
+drop_cols.append(col)
+return drop_cols
+import shap
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+def generate_shap(model, X):
+print("🧪 SHAP Debug: Model type =", type(model))
+print("🧪 SHAP Debug: X shape =", X.shape)
+print("🧪 SHAP Debug: Columns =", list(X.columns))
+# Extract raw model from FLAML
+native_model = getattr(model, "model", model)
+# Try to align X with model input features
+try:
+model_features = model.feature_names_in_
+48
+X = X[model_features].copy()
+except AttributeError:
+model_features = list(X.columns)
+# Convert object and category types
+for col in X.columns:
+if X[col].dtype == "object" or pd.api.types.is_categorical_dtype(X[col]):
+le = LabelEncoder()
+X[col] = le.fit_transform(X[col].astype(str))
+elif pd.api.types.is_integer_dtype(X[col]) or pd.api.types.is_float_dtype(X[col]):
+X[col] = pd.to_numeric(X[col], errors='coerce')
+else:
+X[col] = X[col].astype(str).astype("category").cat.codes
+X = X.fillna(0)
+try:
+# Use TreeExplainer for LGBM models
+explainer = shap.TreeExplainer(native_model)
+shap_values = explainer.shap_values(X)
+os.makedirs("outputs", exist_ok=True)
+shap.summary_plot(shap_values, X, show=False)
+plt.tight_layout()
+plt.savefig("outputs/shap_plot.png")
+plt.close()
+print("✅ SHAP plot saved to outputs/shap_plot.png")
+except Exception as e:
+print("❌ SHAP generation error:", e)
+raise RuntimeError("SHAP failed: " + str(e))
+def plot_target_distribution(df: pd.DataFrame, target_col: str):
+"""Plots and saves the target column distribution as an image."""
+plt.figure(figsize=(8, 4))
+try:
+sns.countplot(data=df, x=target_col)
+except Exception:
+sns.histplot(data=df, x=target_col, bins=30)
+plt.title("Target Column Distribution")
+plt.xticks(rotation=45)
+49
+os.makedirs("outputs", exist_ok=True) # Ensure outputs directory exists
+plt.tight_layout()
+plt.savefig("outputs/target_dist.png")
+plt.close()
+A.3 agent.py – Gemini API Integration
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import pandas as pd
+from langchain_google_genai import ChatGoogleGenerativeAI
+class AutoMLAgent:
+def __init__(self, model="models/gemini-2.0-flash"):
+self.llm = ChatGoogleGenerativeAI(
+model=model,
+google_api_key=os.getenv("GOOGLE_API_KEY")
+)
+def ask(self, question: str) -> str:
+response = self.llm.invoke(question)
+return response.content.strip()
+def get_task_type(self, df: pd.DataFrame) -> str:
+prompt = f"""
+You are a data scientist. Given the dataset with columns:
+{list(df.columns)},
+determine the type of ML problem (classification or regression).
+Return one word only: "classification" or "regression".
+"""
+return self.ask(prompt).lower()
+def get_cleaning_suggestion(self, df: pd.DataFrame) -> str:
+prompt = f"""
+You are a data science assistant. Given this sample of the dataset:
+{df.head(10).to_string(index=False)},
+suggest:
+- Handling missing values
+- Feature engineering or dropping unnecessary columns
+- Data type conversions
+50
+Respond in bullet points.
+"""
+response = self.llm.invoke(prompt)
+return response.content.strip()
+def get_cleaning_code(self, df: pd.DataFrame) -> str:
+import re
+def clean_response_code(code: str) -> str:
+# Remove triple backticks and python language markers
+code = re.sub(r"```(?:python)?", "", code)
+code = re.sub(r"```", "", code)
+return code.strip()
+prompt = f"""
+You're a data preprocessing assistant. The following is a sample dataset:
+{df.head(10).to_markdown(index=False)}
+Based on this data, generate Python Pandas code that:
+1. Handles missing values (drop or fill),
+2. Fixes obvious type issues,
+3. Removes duplicates or outliers if needed.
+Only return executable Python code inside a function named clean_data(df),
+which accepts a DataFrame and returns the cleaned DataFrame.
+Only return pure Python code. No markdown. No explanation. No formatting
+characters.
+"""
+response = self.llm.invoke(prompt)
+raw_code = response.content.strip()
+return clean_response_code(raw_code)
+A.4 predictor_ui.py – Prediction UI
+import streamlit as st
+import pickle
+import pandas as pd
+import os
+import joblib
+import base64
+51
+st.set_page_config(layout="centered", page_title="Prediction UI", page_icon="🤖")
+# --- Custom CSS for background and professional UI ---
+def get_base64(bin_file):
+with open(bin_file, "rb") as f:
+return base64.b64encode(f.read()).decode()
+def set_bg_from_local(image_file):
+ext = image_file.split('.')[-1]
+bin_str = get_base64(image_file)
+st.markdown(
+f"""
+<style>
+.stApp {{
+background-image: url("data:image/{ext};base64,{bin_str}");
+background-size: cover;
+background-repeat: no-repeat;
+background-attachment: fixed;
+}}
+</style>
+""",
+unsafe_allow_html=True
+)
+# Set background image (make sure the file exists in your directory)
+set_bg_from_local("background.jpg")
+# --- Custom CSS for professional UI ---
+st.markdown(
+"""
+<style>
+.main > div {
+background: rgba(255, 255, 255, 0.92);
+border-radius: 18px;
+padding: 2.5rem 2rem 2rem 2rem;
+margin-top: 2rem;
+box-shadow: 0 4px 24px 0 rgba(44, 62, 80, 0.12);
+max-width: 520px;
+margin-left: auto;
+margin-right: auto;
+}
+.stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+color: #1e272e;
+52
+font-weight: 700;
+}
+.stButton>button {
+background-color: #2980b9;
+color: white;
+border: none;
+border-radius: 8px;
+padding: 0.6em 1.2em;
+font-weight: 600;
+font-size: 1.1em;
+margin-top: 1em;
+margin-bottom: 1em;
+transition: background 0.2s;
+}
+.stButton>button:hover {
+background-color: #1e6fa6;
+}
+.stTextInput>div>div>input, .stNumberInput>div>input, .stTextArea>div>textarea
+{
+background-color: #f5f5f5 !important;
+color: #333;
+border-radius: 6px;
+border: 1px solid #d0d0d0;
+}
+#MainMenu, footer {visibility: hidden;}
+</style>
+""",
+unsafe_allow_html=True
+)
+st.markdown("<h1 style='text-align:center;'>📡 Deployed Prediction UI</h1>",
+unsafe_allow_html=True)
+if st.button("Logout / Close Predictor UI"):
+st.session_state.clear()
+st.success("You have been logged out. You can now close this tab.")
+st.stop()
+# --- Model Loading ---
+if not os.path.exists("trained_model.pkl"):
+st.error("❌ Trained model not found!")
+st.stop()
+53
+with open("trained_model.pkl", "rb") as f:
+model = pickle.load(f)
+if not os.path.exists("feature_types.pkl"):
+st.error("❌ Feature types not found!")
+st.stop()
+with open("feature_types.pkl", "rb") as f:
+feature_types = pickle.load(f)
+model_features = list(model.feature_names_in_) if hasattr(model,
+"feature_names_in_") else list(feature_types.keys())
+# --- Input Form ---
+with st.form("prediction_form"):
+st.markdown("### ✍️ Enter Input Values")
+inputs = {}
+for feature in model_features:
+dtype = feature_types.get(feature, "float64")
+if dtype in ["float64", "float32"]:
+value = st.number_input(f"{feature}", value=0.0, format="%.4f")
+elif dtype in ["int64", "int32"]:
+value = st.number_input(f"{feature}", value=0, step=1)
+elif dtype == "bool":
+value = st.checkbox(f"{feature}")
+else:
+value = st.text_input(f"{feature}")
+inputs[feature] = value
+submitted = st.form_submit_button("Predict")
+if submitted:
+try:
+input_df = pd.DataFrame([inputs])
+input_df = input_df[model_features] # Ensure correct column order
+for feature in model_features:
+dtype = feature_types.get(feature, "float64")
+if dtype in ["int64", "int32"]:
+input_df[feature] = pd.to_numeric(input_df[feature],
+errors="coerce").fillna(0).astype(int)
+elif dtype in ["float64", "float32"]:
+54
+input_df[feature] = pd.to_numeric(input_df[feature],
+errors="coerce").fillna(0.0).astype(float)
+elif dtype == "bool":
+input_df[feature] = input_df[feature].astype(bool)
+else:
+input_df[feature] = input_df[feature].astype("category")
+prediction = model.predict(input_df)
+label_path = "label_encoder.pkl"
+if os.path.exists(label_path):
+label_encoder = joblib.load(label_path)
+decoded = label_encoder.inverse_transform(prediction)
+st.success("🎯 Prediction:")
+st.markdown(f"<span style='color:#2980b9;fontsize:1.2em'><b>{decoded[0]}</b></span>", unsafe_allow_html=True)
+if hasattr(model, "predict_proba"):
+proba = model.predict_proba(input_df)
+st.markdown("#### 📊 Probabilities:")
+st.json({label_encoder.classes_[i]: float(prob) for i, prob in
+enumerate(proba[0])})
+else:
+st.success("🎯 Prediction:")
+st.markdown(f"<span style='color:#2980b9;fontsize:1.2em'><b>{prediction[0]}</b></span>", unsafe_allow_html=True)
+except Exception as e:
+st.error(f"❌ Prediction failed: {e}")
+# --- Optional: Add a footer ---
+st.markdown(
+"""
+<div style='text-align:right; color: #888; font-size: 13px; margin-top: 2em;'>
+Need help? Contact: <a
+href="mailto:sairamanmathivelan@gmail.com">sairamanmathivelan@gmail.com</a
+>
+</div>
+""",
+unsafe_allow_html=True
